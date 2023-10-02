@@ -13,6 +13,7 @@ from PIL import Image
 import matplotlib.pyplot as plt
 import os
 from tqdm.notebook import tqdm
+from torchmetrics.classification import BinaryAUROC, MulticlassAUROC
 
 # Set up the configuration
 class Config:
@@ -50,8 +51,15 @@ dataframe['onelabel'] = dataframe[config.TARGET_COLS].apply(lambda x: ''.join(x.
 # Convert the string to decimal
 dataframe['onelabel'] = dataframe['onelabel'].apply(lambda x: int(x, 2))
 
-# dataframe['onelabel'] == 4882 is only one data and it cant split so conert it 4706
+# dataframe['onelabel'] == 4882 is only one data and it cant split. so conert it 4706
 dataframe['onelabel'] = dataframe['onelabel'].apply(lambda x: 4706 if x == 4882 else x)
+
+# conert the 'onelabel' to 0 to N - 1 (N is the number of unique labels)
+dataframe['onelabel'] = dataframe['onelabel'].astype('category').cat.codes
+
+# dictionary for the label and the number
+label_dict = dict(enumerate(dataframe['onelabel'].astype('category').cat.categories))
+
 
 # Split the data
 train_df, test_df = train_test_split(dataframe, test_size=0.5, random_state=42, stratify=dataframe['onelabel'])
@@ -77,11 +85,11 @@ class CustomDataset(Dataset):
         #labels = (labels[:1], labels[1:3], labels[3:6], labels[6:9], labels[9:12])
         #labels = torch.tensor(labels, dtype=torch.float32)
         labels = {
-            'bowel': torch.argmax(torch.tensor(labels[:1], dtype=torch.float32)),
-            'extravasation': torch.argmax(torch.tensor(labels[1:3], dtype=torch.float32)),
-            'kidney': torch.argmax(torch.tensor(labels[3:6], dtype=torch.float32)),
-            'liver': torch.argmax(torch.tensor(labels[6:9], dtype=torch.float32)),
-            'spleen': torch.argmax(torch.tensor(labels[9:12], dtype=torch.float32)),
+            'bowel': torch.argmax(torch.tensor(labels[:1], dtype=torch.float32)), # binary label
+            'extravasation': torch.argmax(torch.tensor(labels[1:3], dtype=torch.float32)), # binary label
+            'kidney': torch.argmax(torch.tensor(labels[3:6], dtype=torch.float32)), # multi-class label
+            'liver': torch.argmax(torch.tensor(labels[6:9], dtype=torch.float32)), # multi-class label
+            'spleen': torch.argmax(torch.tensor(labels[9:12], dtype=torch.float32)), # multi-class label
         }
 
         if self.transform:
@@ -93,6 +101,7 @@ class CustomDataset(Dataset):
 transform = transforms.Compose([
     transforms.Grayscale(num_output_channels=3),  # Convert grayscale to "RGB" (3 channels)
     transforms.Resize(256),
+    transforms.CenterCrop(224),
     transforms.ToTensor(),
     transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
 ])
@@ -148,8 +157,46 @@ class MultiHeadGPUNet(nn.Module):
 
         return out1, out2, out3, out4, out5
 
+class MonoHeadGPUNet(nn.Module):
+    def __init__(self):
+        super(MonoHeadGPUNet, self).__init__()
+
+        # Load the pretrained GPU model
+        model_type = "GPUNet-0" # select one from above
+        precision = "fp16" # select either fp32 of fp16 (for better performance on GPU)
+        self.base_model = torch.hub.load('NVIDIA/DeepLearningExamples:torchhub', 'nvidia_gpunet', pretrained=True, model_type=model_type, model_math=precision)
+
+        # Freeze the parameters
+        for param in self.base_model.parameters():
+            param.requires_grad = False
+        
+        # Replace the existing classifier with your own multi-head output
+        out_features = 1000
+        self.base_model.classifier = nn.Sequential(
+            nn.Dropout(p=0.2, inplace=True),
+            nn.Linear(in_features=1280, out_features=out_features, bias=True)
+        )
+        
+
+        # Define the new classifiers (heads)
+        self.output = nn.Linear(out_features, 33)
+
+    def forward(self, x):
+        x = self.base_model(x)
+        x = x.view(x.size(0), -1)  # Flatten
+
+        out = self.output
+
+        return out
+
+
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-model = MultiHeadGPUNet()
+
+model_flag = {'mono': MonoHeadGPUNet(),
+                'multi': MultiHeadGPUNet()}
+
+flag = 'mono'
+model = model_flag[flag]
 model = model.to(device)
 
 # Define the loss function and optimizer
@@ -161,6 +208,7 @@ for epoch in range(config.EPOCHS):
     model.train()
     total_loss = 0.0
     total_correct = [0] * 5
+    total_auc = [0.0] * 5
 
     for i, (inputs, labels_dict) in enumerate(tqdm(train_loader)):
 
@@ -174,18 +222,47 @@ for epoch in range(config.EPOCHS):
         loss.backward()
         optimizer.step()
 
-        #print(f"Epoch [{epoch+1}/{config.EPOCHS}], Loss: {loss.item()}")
-
         total_loss += loss.item()
-        for i, output in enumerate(outputs):
-            _, predicted = output.max(1)
-            total_correct[i] += (predicted == labels_list[i]).sum().item()
 
+        # Calculate the accuracy
+        for i, output in enumerate(outputs):
+            # Get the predictions from max value index (argmax)
+            _, predicted = output.max(1)
+            # Add the number of correct predictions to the total_correct count
+            total_correct[i] += (predicted == labels_list[i]).sum().item()
+            total_auc[i] += roc_auc_score(labels_list[i].cpu().numpy(), output[:, 1].cpu().numpy())
+
+    # Calculate the average of all multiples heads
     avg_loss = total_loss / len(train_loader.dataset)
     avg_accs = [correct / len(train_loader.dataset) for correct in total_correct]
+    avg_aucs = [auc / len(val_loader.dataset) for auc in total_val_auc]
+
+    # Caluculate each head accuracy and AUC
+    acc_bowel = avg_accs[0]
+    acc_extravasation = avg_accs[1]
+    acc_kidney = avg_accs[2]
+    acc_liver = avg_accs[3]
+    acc_spleen = avg_accs[4]
+    auc_bowel = avg_aucs[0]
+    auc_extravasation = avg_aucs[1]
+    auc_kidney = avg_aucs[2]
+    auc_liver = avg_aucs[3]
+    auc_spleen = avg_aucs[4]
+
 
     #writer.add_scalar('Train/Loss', avg_loss, epoch)
     print({'Train/Loss': avg_loss, 'EPOCH': epoch})
+    print({'head': 'Train/Accuracy_head_0', 'acc':acc_bowel, 'epoch':epoch})
+    print({'head': 'Train/Accuracy_head_1', 'acc':acc_extravasation, 'epoch':epoch})
+    print({'head': 'Train/Accuracy_head_2', 'acc':acc_kidney, 'epoch':epoch})
+    print({'head': 'Train/Accuracy_head_3', 'acc':acc_liver, 'epoch':epoch})
+    print({'head': 'Train/Accuracy_head_4', 'acc':acc_spleen, 'epoch':epoch})
+    print({'head': 'Train/AUC_head_0', 'auc':auc_bowel, 'epoch':epoch})
+    print({'head': 'Train/AUC_head_1', 'auc':auc_extravasation, 'epoch':epoch})
+    print({'head': 'Train/AUC_head_2', 'auc':auc_kidney, 'epoch':epoch})
+    print({'head': 'Train/AUC_head_3', 'auc':auc_liver, 'epoch':epoch})
+    print({'head': 'Train/AUC_head_4', 'auc':auc_spleen, 'epoch':epoch})
+
     # run.log({'Train/Loss': avg_loss, 'EPOCH': epoch})
     # for i, acc in enumerate(avg_accs):
     #     #writer.add_scalar(f'Train/Accuracy_head_{i}', acc, epoch)
@@ -197,6 +274,7 @@ for epoch in range(config.EPOCHS):
     model.eval()
     total_val_loss = 0.0
     total_val_correct = [0] * 5
+    total_val_auc = [0.0] * 5
 
     with torch.no_grad():
         for  i, (inputs, labels_dict) in enumerate(tqdm(val_loader)):
@@ -213,18 +291,37 @@ for epoch in range(config.EPOCHS):
             for i, output in enumerate(outputs):
                 _, predicted = output.max(1)
                 total_val_correct[i] += (predicted == labels_list[i]).sum().item()
+                total_val_auc[i] += roc_auc_score(labels_list[i].cpu().numpy(), output[:, 1].cpu().numpy())
 
     avg_val_loss = total_val_loss / len(val_loader.dataset)
     avg_val_accs = [correct / len(val_loader.dataset) for correct in total_val_correct]
+    avg_val_aucs = [auc / len(val_loader.dataset) for auc in total_val_auc]
 
     #writer.add_scalar('Validation/Loss', avg_val_loss, epoch)
     print({'Validation/Loss': avg_val_loss, 'EPOCH': epoch})
-    # run.log({'Validation/Loss': avg_val_loss, 'EPOCH': epoch})
-    # for i, acc in enumerate(avg_val_accs):
-    #     #writer.add_scalar(f'Validation/Accuracy_head_{i}', acc, epoch)
-    #     run.log({'head': f'Validation/Accuracy_head_{i}',
-    #               'acc':acc,
-    #               'epoch':epoch})
+    # Calculate each head accuracy and AUC
+    acc_val_bowel = avg_val_accs[0]
+    auc_val_bowel = avg_val_aucs[0]
+    acc_val_extravasation = avg_val_accs[1]
+    auc_val_extravasation = avg_val_aucs[1]
+    acc_val_kidney = avg_val_accs[2]
+    auc_val_kidney = avg_val_aucs[2]
+    acc_val_liver = avg_val_accs[3]
+    auc_val_liver = avg_val_aucs[3]
+    acc_val_spleen = avg_val_accs[4]
+    auc_val_spleen = avg_val_aucs[4]
+
+    print({'Validation/Loss': avg_val_loss, 'EPOCH': epoch})
+    print({'head': 'Validation/Accuracy_head_0', 'acc': acc_val_bowel, 'epoch': epoch})
+    print({'head': 'Validation/AUC_head_0', 'auc': auc_val_bowel, 'epoch': epoch})
+    print({'head': 'Validation/Accuracy_head_1', 'acc': acc_val_extravasation, 'epoch': epoch})
+    print({'head': 'Validation/AUC_head_1', 'auc': auc_val_extravasation, 'epoch': epoch})
+    print({'head': 'Validation/Accuracy_head_2', 'acc': acc_val_kidney, 'epoch': epoch})
+    print({'head': 'Validation/AUC_head_2', 'auc': auc_val_kidney, 'epoch': epoch})
+    print({'head': 'Validation/Accuracy_head_3', 'acc': acc_val_liver, 'epoch': epoch})
+    print({'head': 'Validation/AUC_head_3', 'auc': auc_val_liver, 'epoch': epoch})
+    print({'head': 'Validation/Accuracy_head_4', 'acc': acc_val_spleen, 'epoch': epoch})
+    print({'head': 'Validation/AUC_head_4', 'auc': auc_val_spleen, 'epoch': epoch})
 
 # Save the model
 torch.save(model.state_dict(), f"{config.BASE_PATH}/model.pth")
@@ -254,6 +351,7 @@ avg_test_loss = total_test_loss / len(test_loader.dataset)
 avg_test_accs = [correct / len(test_loader.dataset) for correct in total_test_correct]
 
 print({'Test/Loss': avg_test_loss})
+
 
 # Save the entire model to a file
 torch.save(model, 'model.pth')
