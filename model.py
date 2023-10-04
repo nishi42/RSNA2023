@@ -157,46 +157,31 @@ class MultiHeadGPUNet(nn.Module):
 
         return out1, out2, out3, out4, out5
 
-class MonoHeadGPUNet(nn.Module):
+class MultiHeadMobileNet(nn.Module):
     def __init__(self):
-        super(MonoHeadGPUNet, self).__init__()
+        super(MultiHeadMobileNet, self).__init__()
 
-        # Load the pretrained GPU model
-        model_type = "GPUNet-0" # select one from above
-        precision = "fp16" # select either fp32 of fp16 (for better performance on GPU)
-        self.base_model = torch.hub.load('NVIDIA/DeepLearningExamples:torchhub', 'nvidia_gpunet', pretrained=True, model_type=model_type, model_math=precision)
+        # Load the pretrained MobileNet model
+        self.base_model = models.mobilenet_v2(weights='DEFAULT')
 
         # Freeze the parameters
         for param in self.base_model.parameters():
             param.requires_grad = False
         
         # Replace the existing classifier with your own multi-head output
-        out_features = 1000
-        self.base_model.classifier = nn.Sequential(
-            nn.Dropout(p=0.2, inplace=True),
-            nn.Linear(in_features=1280, out_features=out_features, bias=True)
-        )
-        
+        self.base_model.classifier[1] = nn.Linear(model.classifier[1].in_features, 33)
 
         # Define the new classifiers (heads)
         self.output = nn.Linear(out_features, 33)
 
     def forward(self, x):
-        x = self.base_model(x)
-        x = x.view(x.size(0), -1)  # Flatten
+        output = self.base_model(x)
 
-        out = self.output
-
-        return out
+        return output
 
 
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-
-model_flag = {'mono': MonoHeadGPUNet(),
-                'multi': MultiHeadGPUNet()}
-
-flag = 'mono'
-model = model_flag[flag]
+model = MultiHeadMobileNet()
 model = model.to(device)
 
 # Define the loss function and optimizer

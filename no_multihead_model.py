@@ -14,6 +14,8 @@ import matplotlib.pyplot as plt
 import os
 from tqdm.notebook import tqdm
 from torcheval.metrics import MulticlassAccuracy, MulticlassAUROC, MulticlassConfusionMatrix
+from sklearn.metrics import roc_auc_score
+from sklearn.model_selection import train_test_split
 
 # Set up the configuration
 class Config:
@@ -28,6 +30,9 @@ class Config:
         "spleen_healthy", "spleen_low", "spleen_high",
     ]
     BASE_PATH = "/kaggle/input/rsna-atd-512x512-png-v2-dataset"
+    MODEL = "mobilenet_v2"
+    CROP = "CenterCROP"
+    DENOSE = 'BilateralFilterTransform'
 
 config = Config()
 
@@ -57,7 +62,13 @@ dataframe['onelabel'] = dataframe['onelabel'].apply(lambda x: 4706 if x == 4882 
 # conert the 'onelabel' to 0 to N - 1 (N is the number of unique labels)
 dataframe['onelabel'] = dataframe['onelabel'].astype('category').cat.codes
 
-# dictionary for the label and the number
+# dictionary for the label and the original number
+unique_labels = dataframe['onelabel'].unique()
+unique_labels.sort()
+label_dict = dict(enumerate(unique_labels))
+# dictionary for the label and the converted
+label_dict = dict(enumerate(dataframe['onelabel'].astype('category').cat.categories))
+
 label_dict = dict(enumerate(dataframe['onelabel'].astype('category').cat.categories))
 
 
@@ -89,10 +100,26 @@ class CustomDataset(Dataset):
 
         return image, labels
 
+# Denoise the image
+class BilateralFilterTransform:
+    def __init__(self, d=15, sigmaColor=75, sigmaSpace=75):
+        self.d = d
+        self.sigmaColor = sigmaColor
+        self.sigmaSpace = sigmaSpace
+
+    def __call__(self, image):
+        # Convert PIL Image to numpy array
+        image_np = np.array(image)
+        denoised_image = cv2.bilateralFilter(image_np, self.d, self.sigmaColor, self.sigmaSpace)
+        # Convert back to PIL Image
+        return ToPILImage()(denoised_image)
+
 # Define Transforms
 transform = transforms.Compose([
     transforms.Grayscale(num_output_channels=3),  # Convert grayscale to "RGB" (3 channels)
     transforms.Resize(256),
+    transforms.CenterCrop(224),
+    BilateralFilterTransform(),
     transforms.ToTensor(),
     transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
 ])
@@ -126,6 +153,19 @@ model.to(device)
 optimizer = optim.Adam(model.parameters(), lr=0.001)
 criterion = nn.CrossEntropyLoss()
 
+# wandb setting
+import wandb
+mykey = '775553d8bb6bd0180350fae46e7d47bd9ef3f0d9'
+wandb = None
+if wandb is not None:
+    wandb.login(key=mykey)
+    run = wandb.init(project="RSNA2023", config={
+            "SEED" : config.SEED,
+            "BATCH_SIZE" : config.BATCH_SIZE,
+            "EPOCHS" : config.EPOCHS,
+            "ARCH.": config.MODEL,
+            "DENOSE": config.DENOSE,
+        })
 
 # Acccuracy, AUROC, Confusion Matrix history
 train_acc_history = []
@@ -174,6 +214,16 @@ for epoch in range(config.EPOCHS):
     print(f"Train/AUROC {train_auroc_history[-1]}")
     print(f"Train/Confusion Matrix {train_confusion_matrix_history[-1]}")
 
+    # wandb log
+    if wandb is not None:
+        run.log({
+            "epoch": epoch,
+            "train_loss": total_loss,
+            "train_acc": train_acc_history[-1],
+            "train_auroc": train_auroc_history[-1],
+            "train_confusion_matrix": train_confusion_matrix_history[-1],
+        })
+
     # Validation
     model.eval()
     total_loss = 0.0
@@ -209,6 +259,16 @@ for epoch in range(config.EPOCHS):
     print(f"Val/AUROC {val_auroc_history[-1]}")
     print(f"Val/Confusion Matrix {val_confusion_matrix_history[-1]}")
 
+    # wandb log
+    if wandb is not None:
+        run.log({
+            "epoch": epoch,
+            "val_loss": total_loss,
+            "val_acc": val_acc_history[-1],
+            "val_auroc": val_auroc_history[-1],
+            "val_confusion_matrix": val_confusion_matrix_history[-1],
+        })
+
     print()
 
 # Test
@@ -243,8 +303,35 @@ print(f"Test/AUROC {test_auroc}")
 print(f"Test/Confusion Matrix {test_confusion_matrix}")
 print()
 
+# wandb log
+if wandb is not None:
+    run.log({
+        "test_loss": total_loss,
+        "test_acc": test_acc,
+        "test_auroc": test_auroc,
+        "test_confusion_matrix": test_confusion_matrix,
+    })
+
 # Save the model
 torch.save(model.state_dict(), "multihead_model.pth")
+
+# Save the model as onnx
+model.eval()
+dummy_input = torch.randn(1, 3, 256, 256, device='cuda')
+torch.onnx.export(model, dummy_input, "multihead_model.onnx")
+
+
+import onnx
+import onnxruntime
+import numpy as np
+import torch
+
+# Load the model from onnx
+onnx_model = onnx.load("multihead_model.onnx")
+
+# Check the model
+onnx.checker.check_model(onnx_model)
+
 
 # Prediction
 # Load the model
@@ -285,9 +372,17 @@ for inputs, labels in tqdm(test_loader):
     pred_labels = [convert_label(index.item()) for index in pred_indices]
     pred_binaries = ['{0:b}'.format(label).zfill(13) for label in pred_labels]
     for binary in pred_binaries:
-        predictions.append(list(binary))
+        # split the binary into 13 digits
+        binary = list(binary)
+        # convert the string to int
+        binary = [int(i) for i in binary]
+        # append the binary to the predictions
+        predictions.append(binary)
 
 predictions_df = pd.DataFrame(predictions, columns=config.TARGET_COLS)
-predictions_df.head()
 
+# Check the predictions
+# Caluculate the auc of each label
 
+for col in config.TARGET_COLS:
+    print(f"{col}: {roc_auc_score(test_df[col], predictions_df[col])}")
