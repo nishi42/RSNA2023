@@ -18,9 +18,9 @@ from torchmetrics.classification import BinaryAUROC, MulticlassAUROC
 # Set up the configuration
 class Config:
     SEED = 42
-    IMAGE_SIZE = [256, 256]
-    BATCH_SIZE = 32
-    EPOCHS = 10
+    IMAGE_SIZE = [512, 512]
+    BATCH_SIZE = 256
+    EPOCHS = 5
     TARGET_COLS  = [
         "bowel_healthy","bowel_injury", "extravasation_healthy","extravasation_injury",
         "kidney_healthy", "kidney_low", "kidney_high",
@@ -28,6 +28,8 @@ class Config:
         "spleen_healthy", "spleen_low", "spleen_high",
     ]
     BASE_PATH = "/content/drive/MyDrive/kaggle/RSNA2023"
+    HALF = True
+
 
 config = Config()
 
@@ -102,9 +104,10 @@ transform = transforms.Compose([
     transforms.Grayscale(num_output_channels=3),  # Convert grayscale to "RGB" (3 channels)
     transforms.Resize(256),
     transforms.CenterCrop(224),
-    transforms.ToTensor(),
+    transforms.ToTensor().half(),  # Convert the image to a PyTorch tensor (half-precision)
     transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
 ])
+
 
 # Create the datasets
 train_dataset = CustomDataset(dataframe=train_df, transform=transform)
@@ -132,11 +135,6 @@ class MultiHeadGPUNet(nn.Module):
         
         # Replace the existing classifier with your own multi-head output
         out_features = 1000
-        self.base_model.classifier = nn.Sequential(
-            nn.Dropout(p=0.2, inplace=True),
-            nn.Linear(in_features=1280, out_features=out_features, bias=True)
-        )
-        
 
         # Define the new classifiers (heads)
         self.head1 = nn.Linear(out_features, 2)  # binary label

@@ -16,6 +16,7 @@ from tqdm.notebook import tqdm
 from torcheval.metrics import MulticlassAccuracy, MulticlassAUROC, MulticlassConfusionMatrix
 from sklearn.metrics import roc_auc_score
 from sklearn.model_selection import train_test_split
+import cv2
 
 # Set up the configuration
 class Config:
@@ -156,7 +157,6 @@ criterion = nn.CrossEntropyLoss()
 # wandb setting
 import wandb
 mykey = '775553d8bb6bd0180350fae46e7d47bd9ef3f0d9'
-wandb = None
 if wandb is not None:
     wandb.login(key=mykey)
     run = wandb.init(project="RSNA2023", config={
