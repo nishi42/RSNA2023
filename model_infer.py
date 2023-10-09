@@ -121,13 +121,11 @@ for pidx, patient_id in tqdm(enumerate(patient_ids), total=len(patient_ids), des
         ort_inputs = {ort_session.get_inputs()[0].name: to_numpy(images)}
         ort_outs = ort_session.run(None, ort_inputs)
         # Apply softmax to each tensor in the outputs
-        softmaxed_outputs = [softmax(_) for _ in ort_outs]
-        preds.append([np.argmax(_) for _ in softmaxed_outputs])
-
+        pred = [F.softmax(torch.tensor(output)) for output in ort_outs[:5]]
+        preds.append(pred)
 
     # Get the output and split it into 5 parts
-    pred = [F.softmax(torch.tensor(output)) for output in ort_outs[:5]]
-    pred = np.concatenate(pred, axis=-1).astype("float32")
+    pred = np.concatenate(preds, axis=-1).astype("float32")
     pred = pred[:len(patient_paths), :]
     pred = np.mean(pred.reshape(1, len(patient_paths), 11), axis=0)
     pred = np.max(pred, axis=0, keepdims=True)

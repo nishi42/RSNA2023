@@ -1,5 +1,3 @@
-# Read the data and train a simple model
-
 import numpy as np
 import pandas as pd
 import torch
@@ -13,28 +11,28 @@ from PIL import Image
 import matplotlib.pyplot as plt
 import os
 from tqdm.notebook import tqdm
-from torchmetrics.classification import MulticlassAccuracy, MulticlassAUROC
+from torchmetrics.classification import MulticlassAccuracy, MulticlassAUROC, BinaryAccuracy, BinaryAUROC
 from sklearn.model_selection import train_test_split, StratifiedGroupKFold
+
 
 # Set up the configuration
 class Config:
     SEED = 42
     IMAGE_SIZE = [512, 512]
     BATCH_SIZE = 256
-    EPOCHS = 5
+    EPOCHS = 10
     TARGET_COLS  = [
         "bowel_healthy","bowel_injury", "extravasation_healthy","extravasation_injury",
         "kidney_healthy", "kidney_low", "kidney_high",
         "liver_healthy", "liver_low", "liver_high",
         "spleen_healthy", "spleen_low", "spleen_high",
     ]
-    BASE_PATH = "/content/drive/MyDrive/kaggle/RSNA2023"
-    HALF = True
-    MODEL = "GPUNet"
+    BASE_PATH = "/content/RSNA2023"
+    HALF = False
+    MODEL = "EfficientNetB0"
     DENOISE = False
-    
 
-
+# Set up the configuration
 config = Config()
 
 # Load the data
@@ -44,8 +42,6 @@ dataframe["image_path"] = f"{config.BASE_PATH}/train_images"\
                     + "/" + dataframe.series_id.astype(str)\
                     + "/" + dataframe.instance_number.astype(str) +".png"
 dataframe = dataframe.drop_duplicates()
-
-# Train teset validation split
 
 # Define the dataset
 class CustomDataset(Dataset):
@@ -64,11 +60,11 @@ class CustomDataset(Dataset):
         #labels = (labels[:1], labels[1:3], labels[3:6], labels[6:9], labels[9:12])
         #labels = torch.tensor(labels, dtype=torch.float32)
         labels = {
-            'bowel': torch.argmax(torch.tensor(labels[:2], dtype=torch.float32)), # binary label
-            'extravasation': torch.argmax(torch.tensor(labels[2:4], dtype=torch.float32)), # binary label
-            'kidney': torch.argmax(torch.tensor(labels[4:7], dtype=torch.float32)), # multi-class label
-            'liver': torch.argmax(torch.tensor(labels[7:10], dtype=torch.float32)), # multi-class label
-            'spleen': torch.argmax(torch.tensor(labels[10:13], dtype=torch.float32)), # multi-class label
+            'bowel': torch.argmax(torch.tensor(labels[:2], dtype=torch.float32)), # binary label, [0, 1]
+            'extravasation': torch.argmax(torch.tensor(labels[2:4], dtype=torch.float32)), # binary label, [0, 1, 2]
+            'kidney': torch.argmax(torch.tensor(labels[4:7], dtype=torch.float32)), # multi-class label, [0, 1, 2]
+            'liver': torch.argmax(torch.tensor(labels[7:10], dtype=torch.float32)), # multi-class label, [0, 1, 2]
+            'spleen': torch.argmax(torch.tensor(labels[10:13], dtype=torch.float32)), # multi-class label, [0, 1, 2]
         }
 
         if self.transform:
@@ -76,10 +72,20 @@ class CustomDataset(Dataset):
 
         return image, labels
 
+# Define the transforms
+transform = transforms.Compose([
+    transforms.Grayscale(num_output_channels=3),  # Convert grayscale to "RGB" (3 channels)
+    transforms.Resize([256, 256]),
+    transforms.CenterCrop([128, 128]),
+    transforms.ToTensor(),
+    transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+])
+
 # Concat all the labels as a string
 dataframe['stratify'] = ''
 for col in config.TARGET_COLS:
     dataframe['stratify'] += dataframe[col].astype(str)
+
 
 # Split the data
 sgkf = StratifiedGroupKFold(n_splits=3, shuffle=True, random_state=config.SEED)
@@ -98,33 +104,19 @@ for fold, (train_idx, val_idx) in enumerate(sgkf.split(dataframe,
     train_dataset = CustomDataset(dataframe=train_df, transform=transform)
     val_dataset = CustomDataset(dataframe=valid_df, transform=transform)
     # Define the dataloader
-    train_loader = DataLoader(train_dataset, batch_size=256, shuffle=False)
-    val_loader = DataLoader(val_dataset, batch_size=256, shuffle=False)
+    train_loader = DataLoader(train_dataset, batch_size=256, shuffle=False, num_workers=2)
+    val_loader = DataLoader(val_dataset, batch_size=256, shuffle=False, num_workers=2)
 
     fold_loaders.append([train_loader, val_loader])
 
-# Select the first fold
-train_loader = fold_loaders[0][0]
-val_loader = fold_loaders[0][1]
-
-# Define the transforms
-transform = transforms.Compose([
-    transforms.Grayscale(num_output_channels=3),  # Convert grayscale to "RGB" (3 channels)
-    transforms.Resize([256, 256]),
-    transforms.CenterCrop([128, 128]),
-    transforms.ToTensor(),
-    transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-])
 
 # Define the model
-class MultiHeadGPUNet(nn.Module):
+class MultiHeadEfficientNet(nn.Module):
     def __init__(self):
-        super(MultiHeadGPUNet, self).__init__()
+        super(MultiHeadEfficientNet, self).__init__()
 
-        # Load the pretrained GPU model
-        model_type = "GPUNet-0" # select one from above
-        precision = "fp32" # select either fp32 of fp16 (for better performance on GPU)
-        self.base_model = torch.hub.load('NVIDIA/DeepLearningExamples:torchhub', 'nvidia_gpunet', pretrained=True, model_type=model_type, model_math=precision)
+        # Load the pretrained efficientnet-b0
+        self.base_model = models.efficientnet_b0(pretrained=True)
 
         # Freeze the parameters
         for param in self.base_model.parameters():
@@ -156,12 +148,14 @@ class MultiHeadGPUNet(nn.Module):
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
 # Define the model
-model = MultiHeadGPUNet()
+model = MultiHeadEfficientNet()
 model = model.to(device)
 
 # Define the loss function and optimizer
-criterion = nn.CrossEntropyLoss()
+criterion1 = nn.BCEWithLogitsLoss()
+criterion2 = nn.CrossEntropyLoss()
 optimizer = torch.optim.AdamW(model.parameters(), lr=0.001)
+
 
 # wandb setting
 import wandb
@@ -190,13 +184,13 @@ for epoch in range(config.EPOCHS):
     total_loss = 0.0
 
     # Metrics for Accuracy and AUROC
-    acc_bowel = MulticlassAccuracy(num_classes=2)
-    acc_extravasation =MulticlassAccuracy(num_classes=2)
+    acc_bowel = BinaryAccuracy()
+    acc_extravasation =BinaryAccuracy()
     acc_kidney = MulticlassAccuracy(num_classes=3)
     acc_liver = MulticlassAccuracy(num_classes=3)
     acc_spleen = MulticlassAccuracy(num_classes=3)
-    auc_bowel = MulticlassAUROC(num_classes=2)
-    auc_extravasation = MulticlassAUROC(num_classes=2)
+    auc_bowel = BinaryAUROC()
+    auc_extravasation = BinaryAUROC()
     auc_kidney = MulticlassAUROC(num_classes=3)
     auc_liver = MulticlassAUROC(num_classes=3)
     auc_spleen = MulticlassAUROC(num_classes=3)
@@ -209,14 +203,14 @@ for epoch in range(config.EPOCHS):
         optimizer.zero_grad()
         inputs = inputs.to(device)
         outputs = model(inputs)
-        outpus = [output.to(device) for output in outputs]
+        outputs = [output.squeeze().to(device) for output in outputs]
 
         # Calculate each output loss
-        loss1 = criterion(outputs[0], labels_list[0])
-        loss2 = criterion(outputs[1], labels_list[1])
-        loss3 = criterion(outputs[2], labels_list[2])
-        loss4 = criterion(outputs[3], labels_list[3])
-        loss5 = criterion(outputs[4], labels_list[4])
+        loss1 = criterion1(outputs[0], labels_list[0].float())
+        loss2 = criterion1(outputs[1], labels_list[1].float())
+        loss3 = criterion2(outputs[2], labels_list[2])
+        loss4 = criterion2(outputs[3], labels_list[3])
+        loss5 = criterion2(outputs[4], labels_list[4])
         # Sum all the losses
         loss = loss1 + loss2 + loss3 + loss4 + loss5
         loss.backward()
@@ -286,14 +280,14 @@ for epoch in range(config.EPOCHS):
     total_val_loss = 0.0
 
     # Metrics for Accuracy 
-    val_acc_bowel = MulticlassAccuracy(num_classes=2)
-    val_acc_extravasation = MulticlassAccuracy(num_classes=2)
+    val_acc_bowel = BinaryAccuracy()
+    val_acc_extravasation = BinaryAccuracy()
     val_acc_kidney = MulticlassAccuracy(num_classes=3)
     val_acc_liver = MulticlassAccuracy(num_classes=3)
     val_acc_spleen = MulticlassAccuracy(num_classes=3)
     # Metrics for AUROC
-    val_auc_bowel = MulticlassAUROC(num_classes=2)
-    val_auc_extravasation = MulticlassAUROC(num_classes=2)
+    val_auc_bowel = BinaryAUROC()
+    val_auc_extravasation = BinaryAUROC()
     val_auc_kidney = MulticlassAUROC(num_classes=3)
     val_auc_liver = MulticlassAUROC(num_classes=3)
     val_auc_spleen = MulticlassAUROC(num_classes=3)
@@ -309,13 +303,13 @@ for epoch in range(config.EPOCHS):
             labels_list = [labels_dict[key].to(device) for key in labels_dict]
 
             outputs = model(inputs)
-            outputs = [output.to(device) for output in outputs]
+            outputs = [output.squeeze().to(device) for output in outputs]
             # Calculate each output loss
-            loss1 = criterion(outputs[0], labels_list[0])
-            loss2 = criterion(outputs[1], labels_list[1])
-            loss3 = criterion(outputs[2], labels_list[2])
-            loss4 = criterion(outputs[3], labels_list[3])
-            loss5 = criterion(outputs[4], labels_list[4])
+            loss1 = criterion1(outputs[0], labels_list[0].float())
+            loss2 = criterion1(outputs[1], labels_list[1].float())
+            loss3 = criterion2(outputs[2], labels_list[2])
+            loss4 = criterion2(outputs[3], labels_list[3])
+            loss5 = criterion2(outputs[4], labels_list[4])
             # Sum all the losses
             loss = loss1 + loss2 + loss3 + loss4 + loss5
             total_val_loss += loss.item()
@@ -361,7 +355,6 @@ for epoch in range(config.EPOCHS):
     print({'head': 'Validation/Accuracy_head_4', 'acc': val_acc_spleen.compute(), 'epoch': epoch})
     print({'head': 'Validation/AUC_head_4', 'auc': val_auc_spleen.compute(), 'epoch': epoch})
 
-
     if wandb is not None:
         run.log({
         'EPOCH': epoch,
@@ -378,85 +371,5 @@ for epoch in range(config.EPOCHS):
         })
 
 
-
 # Save the model
-torch.save(model.state_dict(), f"{config.BASE_PATH}/model.pth")    
-
-# Test the model
-model.eval()
-total_test_loss = 0.0
-test_acc_history = []
-test_auroc_history = []
-
-test_acc_bowel = MulticlassAccuracy(num_classes=2)
-test_acc_extravasation = MulticlassAccuracy(num_classes=2)
-test_acc_kidney = MulticlassAccuracy(num_classes=3)
-test_acc_liver = MulticlassAccuracy(num_classes=3)
-test_acc_spleen = MulticlassAccuracy(num_classes=3)
-test_auc_bowel = MulticlassAUROC(num_classes=2)
-test_auc_extravasation = MulticlassAUROC(num_classes=2)
-test_auc_kidney = MulticlassAUROC(num_classes=3)
-test_auc_liver = MulticlassAUROC(num_classes=3)
-test_auc_spleen = MulticlassAUROC(num_classes=3)
-
-test_df = pd.read_csv('PATH')
-test_df["image_path"] = f"{config.BASE_PATH}/train_images"\
-                    + "/" + test_df.patient_id.astype(str)\
-                    + "/" + test_df.series_id.astype(str)\
-                    + "/" + test_df.instance_number.astype(str) +".png"
-test_df = test_df.drop_duplicates()
-
-test_dataset = CustomDataset(dataframe=test_df, transform=transform)
-test_loader = DataLoader(test_dataset, batch_size=256, shuffle=False)
-
-with torch.no_grad():
-    for  i, (inputs, labels_dict) in enumerate(tqdm(test_loader)):
-        # Move inputs to the device
-        inputs = inputs.to(device)
-
-        # Move labels in the dictionary to the device
-        labels_dict = {k: v.to(device) for k, v in labels_dict.items()}
-        labels_list = [labels_dict[key].to(device) for key in labels_dict]
-
-        outputs = model(inputs)
-
-        # No need to caluculate the loss for the test set
-        
-        # Calculate the accuracy
-        test_acc_bowel.update(outputs[0].cpu(), labels_list[0].cpu())
-        test_acc_extravasation.update(outputs[1].cpu(), labels_list[1].cpu())
-        test_acc_kidney.update(outputs[2].cpu(), labels_list[2].cpu())
-        test_acc_liver.update(outputs[3].cpu(), labels_list[3].cpu())
-        test_acc_spleen.update(outputs[4].cpu(), labels_list[4].cpu())
-        
-        # Calculate the AUROC for each head
-        test_auc_bowel.update(outputs[0].cpu(), labels_list[0].cpu())
-        test_auc_extravasation.update(outputs[1].cpu(), labels_list[1].cpu())
-        test_auc_kidney.update(outputs[2].cpu(), labels_list[2].cpu())
-        test_auc_liver.update(outputs[3].cpu(), labels_list[3].cpu())
-        test_auc_spleen.update(outputs[4].cpu(), labels_list[4].cpu())
-
-print({'head': 'Test/Accuracy_head_0', 'acc': test_acc_bowel.compute()})
-print({'head': 'Test/AUC_head_0', 'auc': test_auc_bowel.compute()})
-print({'head': 'Test/Accuracy_head_1', 'acc': test_acc_extravasation.compute()})
-print({'head': 'Test/AUC_head_1', 'auc': test_auc_extravasation.compute()})
-print({'head': 'Test/Accuracy_head_2', 'acc': test_acc_kidney.compute()})
-print({'head': 'Test/AUC_head_2', 'auc': test_auc_kidney.compute()})
-print({'head': 'Test/Accuracy_head_3', 'acc': test_acc_liver.compute()})
-print({'head': 'Test/AUC_head_3', 'auc': test_auc_liver.compute()})
-print({'head': 'Test/Accuracy_head_4', 'acc': test_acc_spleen.compute()})
-print({'head': 'Test/AUC_head_4', 'auc': test_auc_spleen.compute()})
-
-if wandb is not None:
-    run.log({
-    "test_bowel_acc": test_acc_bowel.compute(),
-    "test_bowel_auc": test_auc_bowel.compute(),
-    "test_extravasation_acc": test_acc_extravasation.compute(),
-    "test_extravasation_auc": test_auc_extravasation.compute(),
-    "test_kidney_acc": test_acc_kidney.compute(),
-    "test_kidney_auc": test_auc_kidney.compute(),
-    "test_liver_acc": test_acc_liver.compute(),
-    "test_liver_auc": test_auc_liver.compute(),
-    "test_spleen_acc": test_acc_spleen.compute(),
-    "test_spleen_auc": test_auc_spleen.compute(),
-    })
+torch.save(model.state_dict(), f"{config.BASE_PATH}/model.pth") 
