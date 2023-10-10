@@ -14,7 +14,8 @@ from tqdm.notebook import tqdm
 from torchmetrics.classification import MulticlassAccuracy, MulticlassAUROC, BinaryAccuracy, BinaryAUROC
 from sklearn.model_selection import train_test_split, StratifiedGroupKFold
 from torch.nn.utils.rnn import pad_sequence, pack_padded_sequence, pad_packed_sequence
-
+import torch.optim as optim
+from torch.optim.lr_scheduler import CosineAnnealingLR
 
 # Set up the configuration
 class Config:
@@ -23,7 +24,7 @@ class Config:
     BATCH_SIZE = 2
     NUM_WORKERS = 2
     DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    EPOCHS = 10
+    EPOCHS = 20
     TARGET_COLS  = [
         "bowel_healthy","bowel_injury", "extravasation_healthy","extravasation_injury",
         "kidney_healthy", "kidney_low", "kidney_high",
@@ -32,7 +33,7 @@ class Config:
     ]
     BASE_PATH = "/content/drive/MyDrive/kaggle/RSNA2023"
     HALF = False
-    MODEL = "EfficientNetB0"
+    MODEL = "ConvNeXt_Tiny"
     DENOISE = False
     CT_STACK_SIZE = 16
     MAX_SEQ_LEN = 50
@@ -58,7 +59,11 @@ idx = dataframe.groupby('patient_id')['series_id'].idxmin()
 # Use the index to filter the dataframe
 dataframe = dataframe.loc[idx]
 
-
+# Stratify by the spleen and kindey (Those are not good learned by the model)
+dataframe['stratify'] = ''
+for col in config.TARGET_COLS:
+    if col in ['spleen_healthy', 'spleen_low', 'spleen_high',  'kidney_healthy', 'kidney_low', 'kidney_high']:
+        dataframe['stratify'] += dataframe[col].astype(str)
 
 # Define the dataset
 class CT_Slices_Dataset(Dataset):
@@ -70,10 +75,27 @@ class CT_Slices_Dataset(Dataset):
         return len(self.dataframe)
 
     # check the image path list length and uniform sampling
-    def uniform_temporal_subsample(self, file_list, target_size):
-        step_size = len(file_list) // target_size
-        downsampled_list = file_list[::step_size][:target_size]
+    def uniform_temporal_subsample(self, ima_file_list, sample_size):
+        step_size = len(ima_file_list) // sample_size
+        downsampled_list = ima_file_list[::step_size][:sample_size]
         return downsampled_list
+
+    def weighted_temporal_subsample(self, ima_file_list, sample_size):
+        # Create a probability distribution
+        total_slices = len(ima_file_list)
+        slice_indices = np.arange(total_slices)
+        center_idx = total_slices // 2
+        
+        # Gaussian distribution centered around the middle slice
+        probabilities = np.exp(-((slice_indices - center_idx) ** 2) / (2 * (total_slices * 0.1) ** 2))
+        probabilities /= probabilities.sum()  # Normalize to sum to 1
+        
+        # Sample using the created distribution
+        selected_indices = np.random.choice(slice_indices, size=sample_size, replace=False, p=probabilities)
+        selected_indices = sorted(selected_indices)  # Sort the indices for sequential access
+        
+        return [ima_file_list[i] for i in selected_indices]
+
 
     def __getitem__(self, idx):
         ima_file_list = self.dataframe.loc[idx, 'image_path']
@@ -81,7 +103,8 @@ class CT_Slices_Dataset(Dataset):
         # uniform sampling
         downsample_size = config.MAX_SEQ_LEN
         if len(ima_file_list) > downsample_size:
-            ima_file_list = self.uniform_temporal_subsample(ima_file_list, downsample_size)
+            #ima_file_list = self.uniform_temporal_subsample(ima_file_list, downsample_size)
+            ima_file_list = self.weighted_temporal_subsample(ima_file_list, downsample_size)
 
         slices = []
         for slice_file in sorted(ima_file_list):
@@ -121,13 +144,19 @@ def collate_fn(batch):
 transform = transforms.Compose([
     transforms.Grayscale(num_output_channels=3),  # Convert grayscale to "RGB" (3 channels)
     transforms.Resize([256, 256]),
-    #transforms.CenterCrop([128, 128]),
+    transforms.CenterCrop([128, 128]),
     transforms.ToTensor(),
     transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
 ])
 
 # Split the data into train and validation sets
-train_df, val_df = train_test_split(dataframe, test_size=0.5, random_state=config.SEED, shuffle=True)
+train_df, val_df = train_test_split(dataframe, 
+                                    test_size=0.2, 
+                                    random_state=config.SEED, 
+                                    shuffle=True,
+                                    stratify=dataframe['stratify'])
+
+# Split the train data into train and validation sets
 train_df.reset_index(inplace=True, drop=True)
 val_df.reset_index(inplace=True, drop=True)
 
@@ -151,7 +180,8 @@ class CNNRNN(nn.Module):
         super(CNNRNN, self).__init__()
 
         # Load the pretrained efficientnet-b0
-        self.base_model = models.efficientnet_b0(pretrained=True)
+        #self.base_model = models.efficientnet_b0(pretrained=True)
+        self.base_model = models.convnext_tiny(weights=models.ConvNeXt_Tiny_Weights.IMAGENET1K_V1)
 
         # Freeze the parameters
         for param in self.base_model.parameters():
@@ -161,18 +191,19 @@ class CNNRNN(nn.Module):
         cnn_out_features = 1000
 
         # RNN output features
-        output_features = 128
+        output_features = 256
 
         # RNN (LSTM) layers
         self.rnn = nn.LSTM(
-            input_size=cnn_out_features,  # ResNet-18の出力特徴のサイズ
+            input_size=cnn_out_features,  
             hidden_size=output_features,
             num_layers=2,
-            batch_first=True
+            batch_first=True,
+            bidirectional=True
         )
 
         # Fully connected layer
-        self.fc = nn.Linear(output_features, 256)
+        self.fc = nn.Linear(2 * output_features, 256)
         
         fc_out_features = 256
 
@@ -213,6 +244,7 @@ model = model.to(device)
 criterion1 = nn.BCEWithLogitsLoss()
 criterion2 = nn.CrossEntropyLoss()
 optimizer = torch.optim.AdamW(model.parameters(), lr=0.001)
+scheduler = CosineAnnealingLR(optimizer, T_max=10)
 
 # wandb setting
 import wandb
@@ -220,13 +252,7 @@ mykey = '775553d8bb6bd0180350fae46e7d47bd9ef3f0d9'
 # wandb = None
 if wandb is not None:
     wandb.login(key=mykey)
-    run = wandb.init(project="RSNA2023", config={
-            "SEED" : config.SEED,
-            "BATCH_SIZE" : config.BATCH_SIZE,
-            "EPOCHS" : config.EPOCHS,
-            "ARCH.": config.MODEL,
-            "DENOISE": config.DENOISE,
-        })
+    run = wandb.init(project="RSNA2023", config=config)
 
 # Acccuracy, AUROC
 train_acc_history = []
@@ -271,6 +297,7 @@ for epoch in range(config.EPOCHS):
         loss = loss1 + loss2 + loss3 + loss4 + loss5
         loss.backward()
         optimizer.step()
+        scheduler.step()
 
         total_loss += loss.item()
 
