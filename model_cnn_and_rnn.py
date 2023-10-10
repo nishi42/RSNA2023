@@ -23,7 +23,7 @@ class Config:
     BATCH_SIZE = 2
     NUM_WORKERS = 2
     DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    EPOCHS = 3
+    EPOCHS = 10
     TARGET_COLS  = [
         "bowel_healthy","bowel_injury", "extravasation_healthy","extravasation_injury",
         "kidney_healthy", "kidney_low", "kidney_high",
@@ -35,6 +35,7 @@ class Config:
     MODEL = "EfficientNetB0"
     DENOISE = False
     CT_STACK_SIZE = 16
+    MAX_SEQ_LEN = 50
 
 # Set up the configuration
 config = Config()
@@ -50,6 +51,15 @@ dataframe = dataframe.drop_duplicates()
 # group by the patient_id, labels and concat image path list
 dataframe = dataframe.groupby(['patient_id', 'series_id', 'bowel_healthy', 'bowel_injury', 'extravasation_healthy', 'extravasation_injury', 'kidney_healthy', 'kidney_low', 'kidney_high', 'liver_healthy', 'liver_low', 'liver_high', 'spleen_healthy', 'spleen_low', 'spleen_high'])['image_path'].apply(list).reset_index(name='image_path')
 
+# choose only lateset CTs
+# Get the index of the rows with the maximum series_id for each patient_id
+idx = dataframe.groupby('patient_id')['series_id'].idxmin()
+
+# Use the index to filter the dataframe
+dataframe = dataframe.loc[idx]
+
+
+
 # Define the dataset
 class CT_Slices_Dataset(Dataset):
     def __init__(self, dataframe, transform=None):
@@ -60,24 +70,18 @@ class CT_Slices_Dataset(Dataset):
         return len(self.dataframe)
 
     # check the image path list length and uniform sampling
-    def uniform_temporal_subsample(x, num_samples):
-        t = len(x)
-        indices = torch.linspace(0, t - 1, num_samples)
-        indices = torch.clamp(indices, 0, t - 1).long()
-        indices = indices.tolist()
-        x = x.tolist()
-        paths = [x[i] for i in indices]
-        return paths
+    def uniform_temporal_subsample(self, file_list, target_size):
+        step_size = len(file_list) // target_size
+        downsampled_list = file_list[::step_size][:target_size]
+        return downsampled_list
 
     def __getitem__(self, idx):
         ima_file_list = self.dataframe.loc[idx, 'image_path']
 
-        # # uniform sampling
-        # sample_size = config.CT_STACK_SIZE
-        # if len(ima_file_list) > sample_size:
-        #     ima_file_list = uniform_temporal_subsample(ima_file_list, 16)
-        # else:
-        #     ima_file_list = ima_file_list + ima_file_list[-1:] * (16 - len(ima_file_list))
+        # uniform sampling
+        downsample_size = config.MAX_SEQ_LEN
+        if len(ima_file_list) > downsample_size:
+            ima_file_list = self.uniform_temporal_subsample(ima_file_list, downsample_size)
 
         slices = []
         for slice_file in sorted(ima_file_list):
@@ -99,10 +103,11 @@ class CT_Slices_Dataset(Dataset):
 
         return slices, len(slices), labels
 
-# DataLoaderでcollate_fnを使用してパディングを適用
+# collate_fn for DataLoader with applying padding
 def collate_fn(batch):
     sequences, lengths, labels_list = zip(*batch)
-    # パディング
+
+    # padding
     sequences_padded = pad_sequence(sequences, batch_first=True)
     lengths = torch.LongTensor(lengths)
 
@@ -116,15 +121,21 @@ def collate_fn(batch):
 transform = transforms.Compose([
     transforms.Grayscale(num_output_channels=3),  # Convert grayscale to "RGB" (3 channels)
     transforms.Resize([256, 256]),
-    transforms.CenterCrop([128, 128]),
+    #transforms.CenterCrop([128, 128]),
     transforms.ToTensor(),
     transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
 ])
 
 # Split the data into train and validation sets
-train_df, val_df = train_test_split(dataframe, test_size=0.2, random_state=config.SEED, shuffle=True)
+train_df, val_df = train_test_split(dataframe, test_size=0.5, random_state=config.SEED, shuffle=True)
 train_df.reset_index(inplace=True, drop=True)
 val_df.reset_index(inplace=True, drop=True)
+
+# Sort the length of image data path
+train_df["length"] = train_df["image_path"].apply(lambda x: len(x))
+train_df = train_df.sort_values(by="length", ascending=False, ignore_index=True)
+val_df["length"] = val_df["image_path"].apply(lambda x: len(x))
+val_df = val_df.sort_values(by="length", ascending=False, ignore_index=True)
 
 # Create the train and validation datasets
 
@@ -248,7 +259,7 @@ for epoch in range(config.EPOCHS):
         optimizer.zero_grad()
         inputs = inputs.to(device)
         outputs = model(inputs, lengths)
-        outputs = [output.squeeze().to(device) for output in outputs]
+        outputs = [output.squeeze(-1).to(device) if output.shape[-1] == 1 else output.to(device) for output in outputs]
 
         # Calculate each output loss
         loss1 = criterion1(outputs[0], labels_list[0].float())
@@ -348,7 +359,7 @@ for epoch in range(config.EPOCHS):
             labels_list = [labels_dict[key].to(device) for key in labels_dict]
 
             outputs = model(inputs, lengths)
-            outputs = [output.squeeze().to(device) for output in outputs]
+            outputs = [output.squeeze(-1).to(device) if output.shape[-1] == 1 else output.to(device) for output in outputs]
             # Calculate each output loss
             loss1 = criterion1(outputs[0], labels_list[0].float())
             loss2 = criterion1(outputs[1], labels_list[1].float())
@@ -417,4 +428,4 @@ for epoch in range(config.EPOCHS):
 
 
 # Save the model
-torch.save(model.state_dict(), f"{config.BASE_PATH}/cnn_rnn_model.pth") 
+# torch.save(model.state_dict(), f"{config.BASE_PATH}/cnn_rnn_model3.pth") 
