@@ -2,7 +2,7 @@ import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
-import torch.nn.functional as F 
+import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms, utils
@@ -24,7 +24,7 @@ class Config:
     BATCH_SIZE = 2
     NUM_WORKERS = 2
     DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    EPOCHS = 20
+    EPOCHS = 10
     TARGET_COLS  = [
         "bowel_healthy","bowel_injury", "extravasation_healthy","extravasation_injury",
         "kidney_healthy", "kidney_low", "kidney_high",
@@ -33,13 +33,26 @@ class Config:
     ]
     BASE_PATH = "/content/drive/MyDrive/kaggle/RSNA2023"
     HALF = False
-    MODEL = "ConvNeXt_Tiny"
+    MODEL = "ConvNeXt_Tiny and bi-LSTM(layer=1)"
     DENOISE = False
     CT_STACK_SIZE = 16
-    MAX_SEQ_LEN = 50
+    MAX_SEQ_LEN = 100
+    CROP = None
 
 # Set up the configuration
 config = Config()
+wandb_config = {
+        "SEED":config.SEED,
+        "IMAGE_SIZE":config.IMAGE_SIZE,
+        "HALF":config.HALF,
+        "DENOISE":config.DENOISE,
+        "MODEL":config.MODEL,
+        "BATCH_SIZE":config.BATCH_SIZE,
+        "MAX_SEQ_LEN":config.MAX_SEQ_LEN,
+        "EPOCHS":config.EPOCHS,
+        
+        "SCHEDULER":"OneCycleLR",
+}
 
 # Load the data
 dataframe = pd.read_csv(f"{config.BASE_PATH}/train.csv")
@@ -54,7 +67,7 @@ dataframe = dataframe.groupby(['patient_id', 'series_id', 'bowel_healthy', 'bowe
 
 # choose only lateset CTs
 # Get the index of the rows with the maximum series_id for each patient_id
-idx = dataframe.groupby('patient_id')['series_id'].idxmin()
+idx = dataframe.groupby('patient_id')['series_id'].idxmax()
 
 # Use the index to filter the dataframe
 dataframe = dataframe.loc[idx]
@@ -62,7 +75,7 @@ dataframe = dataframe.loc[idx]
 # Stratify by the spleen and kindey (Those are not good learned by the model)
 dataframe['stratify'] = ''
 for col in config.TARGET_COLS:
-    if col in ['spleen_healthy', 'spleen_low', 'spleen_high',  'kidney_healthy', 'kidney_low', 'kidney_high']:
+    if col in ['spleen_healthy', 'spleen_low', 'spleen_high']:
         dataframe['stratify'] += dataframe[col].astype(str)
 
 # Define the dataset
@@ -85,15 +98,15 @@ class CT_Slices_Dataset(Dataset):
         total_slices = len(ima_file_list)
         slice_indices = np.arange(total_slices)
         center_idx = total_slices // 2
-        
+
         # Gaussian distribution centered around the middle slice
         probabilities = np.exp(-((slice_indices - center_idx) ** 2) / (2 * (total_slices * 0.1) ** 2))
         probabilities /= probabilities.sum()  # Normalize to sum to 1
-        
+
         # Sample using the created distribution
         selected_indices = np.random.choice(slice_indices, size=sample_size, replace=False, p=probabilities)
         selected_indices = sorted(selected_indices)  # Sort the indices for sequential access
-        
+
         return [ima_file_list[i] for i in selected_indices]
 
 
@@ -103,8 +116,8 @@ class CT_Slices_Dataset(Dataset):
         # uniform sampling
         downsample_size = config.MAX_SEQ_LEN
         if len(ima_file_list) > downsample_size:
-            #ima_file_list = self.uniform_temporal_subsample(ima_file_list, downsample_size)
-            ima_file_list = self.weighted_temporal_subsample(ima_file_list, downsample_size)
+            ima_file_list = self.uniform_temporal_subsample(ima_file_list, downsample_size)
+            #ima_file_list = self.weighted_temporal_subsample(ima_file_list, downsample_size)
 
         slices = []
         for slice_file in sorted(ima_file_list):
@@ -144,15 +157,15 @@ def collate_fn(batch):
 transform = transforms.Compose([
     transforms.Grayscale(num_output_channels=3),  # Convert grayscale to "RGB" (3 channels)
     transforms.Resize([256, 256]),
-    transforms.CenterCrop([128, 128]),
+    #transforms.CenterCrop([128, 128]),
     transforms.ToTensor(),
     transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
 ])
 
 # Split the data into train and validation sets
-train_df, val_df = train_test_split(dataframe, 
-                                    test_size=0.2, 
-                                    random_state=config.SEED, 
+train_df, val_df = train_test_split(dataframe,
+                                    test_size=0.2,
+                                    random_state=config.SEED,
                                     shuffle=True,
                                     stratify=dataframe['stratify'])
 
@@ -186,7 +199,7 @@ class CNNRNN(nn.Module):
         # Freeze the parameters
         for param in self.base_model.parameters():
             param.requires_grad = False
-        
+
         # CNN output features
         cnn_out_features = 1000
 
@@ -195,16 +208,16 @@ class CNNRNN(nn.Module):
 
         # RNN (LSTM) layers
         self.rnn = nn.LSTM(
-            input_size=cnn_out_features,  
+            input_size=cnn_out_features,
             hidden_size=output_features,
-            num_layers=2,
+            num_layers=1,
             batch_first=True,
             bidirectional=True
         )
 
         # Fully connected layer
         self.fc = nn.Linear(2 * output_features, 256)
-        
+
         fc_out_features = 256
 
         # Define the new classifiers (heads)
@@ -233,6 +246,23 @@ class CNNRNN(nn.Module):
 
         return out1, out2, out3, out4, out5
 
+class FocalLoss(nn.Module):
+    def __init__(self, alpha=1, gamma=2, reduction='mean'):
+        super(FocalLoss, self).__init__()
+        self.alpha = alpha
+        self.gamma = gamma
+        self.reduction = reduction
+
+    def forward(self, inputs, targets):
+        BCE_loss = F.binary_cross_entropy_with_logits(inputs, targets, reduction='none')
+        pt = torch.exp(-BCE_loss)  # pt = p if y=1, pt = 1-p if y=0
+        F_loss = self.alpha * (1-pt)**self.gamma * BCE_loss
+
+        if self.reduction == 'sum':
+            return F_loss.sum()
+        elif self.reduction == 'mean':
+            return F_loss.mean()
+
 # Define the device
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
@@ -241,10 +271,12 @@ model = CNNRNN()
 model = model.to(device)
 
 # Define the loss function and optimizer
-criterion1 = nn.BCEWithLogitsLoss()
+#criterion1 = nn.BCEWithLogitsLoss()
+criterion1 = FocalLoss(alpha=1, gamma=2)
 criterion2 = nn.CrossEntropyLoss()
 optimizer = torch.optim.AdamW(model.parameters(), lr=0.001)
-scheduler = CosineAnnealingLR(optimizer, T_max=10)
+#scheduler = CosineAnnealingLR(optimizer, T_max=10)
+scheduler = optim.lr_scheduler.OneCycleLR(optimizer, max_lr=0.01, steps_per_epoch=len(train_loader), epochs=10)
 
 # wandb setting
 import wandb
@@ -252,7 +284,7 @@ mykey = '775553d8bb6bd0180350fae46e7d47bd9ef3f0d9'
 # wandb = None
 if wandb is not None:
     wandb.login(key=mykey)
-    run = wandb.init(project="RSNA2023", config=config)
+    run = wandb.init(project="RSNA2023", config=wandb_config)
 
 # Acccuracy, AUROC
 train_acc_history = []
@@ -315,7 +347,7 @@ for epoch in range(config.EPOCHS):
         auc_kidney.update(outputs[2].cpu(), labels_list[2].cpu())
         auc_liver.update(outputs[3].cpu(), labels_list[3].cpu())
         auc_spleen.update(outputs[4].cpu(), labels_list[4].cpu())
-        
+
 
     # Add to the history
     train_acc_history.append({"EPOCH": epoch,
@@ -362,7 +394,7 @@ for epoch in range(config.EPOCHS):
     model.eval()
     total_val_loss = 0.0
 
-    # Metrics for Accuracy 
+    # Metrics for Accuracy
     val_acc_bowel = BinaryAccuracy()
     val_acc_extravasation = BinaryAccuracy()
     val_acc_kidney = MulticlassAccuracy(num_classes=3)
@@ -411,7 +443,7 @@ for epoch in range(config.EPOCHS):
             val_auc_liver.update(outputs[3].cpu(), labels_list[3].cpu())
             val_auc_spleen.update(outputs[4].cpu(), labels_list[4].cpu())
 
-    
+
     # Add to the history
     val_acc_history.append({"EPOCH": epoch,
                                 "bowel": val_acc_bowel.compute(),
@@ -425,7 +457,7 @@ for epoch in range(config.EPOCHS):
                                 "kidney": val_auc_kidney.compute(),
                                 "liver": val_auc_liver.compute(),
                                 "spleen": val_auc_spleen.compute()})
-    
+
     print({'EPOCH': epoch})
     print({'head': 'Validation/Accuracy_head_0', 'acc': val_acc_bowel.compute(), 'epoch': epoch})
     print({'head': 'Validation/AUC_head_0', 'auc': val_auc_bowel.compute(), 'epoch': epoch})
@@ -455,4 +487,4 @@ for epoch in range(config.EPOCHS):
 
 
 # Save the model
-# torch.save(model.state_dict(), f"{config.BASE_PATH}/cnn_rnn_model3.pth") 
+# torch.save(model.state_dict(), f"{config.BASE_PATH}/cnn_rnn_model3.pth")
