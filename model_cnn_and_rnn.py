@@ -21,7 +21,7 @@ from torch.optim.lr_scheduler import CosineAnnealingLR
 class Config:
     SEED = 42
     IMAGE_SIZE = [512, 512]
-    BATCH_SIZE = 2
+    BATCH_SIZE = 8
     NUM_WORKERS = 2
     DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     EPOCHS = 10
@@ -34,10 +34,11 @@ class Config:
     BASE_PATH = "/content/drive/MyDrive/kaggle/RSNA2023"
     HALF = False
     MODEL = "ConvNeXt_Tiny and bi-LSTM(layer=1)"
-    DENOISE = False
+    DENOISE = True
     CT_STACK_SIZE = 16
-    MAX_SEQ_LEN = 100
+    MAX_SEQ_LEN = 50
     CROP = None
+    FREEZE = 6
 
 # Set up the configuration
 config = Config()
@@ -50,8 +51,11 @@ wandb_config = {
         "BATCH_SIZE":config.BATCH_SIZE,
         "MAX_SEQ_LEN":config.MAX_SEQ_LEN,
         "EPOCHS":config.EPOCHS,
-        
-        "SCHEDULER":"OneCycleLR",
+        "FREEZE":config.FREEZE,
+
+        "SCHEDULER":"CosineAnnealingLR",
+        "FOCAL_LOSS_gamma": 2.5,
+        "FOCAL_LOSS_alpha": 0.5
 }
 
 # Load the data
@@ -153,6 +157,9 @@ def collate_fn(batch):
 
     return sequences_padded, lengths, labels_dict
 
+from skimage.restoration import denoise_nl_means, estimate_sigma
+from torchvision.transforms import ToPILImage, ToTensor
+
 # Define the transforms
 transform = transforms.Compose([
     transforms.Grayscale(num_output_channels=3),  # Convert grayscale to "RGB" (3 channels)
@@ -196,8 +203,12 @@ class CNNRNN(nn.Module):
         #self.base_model = models.efficientnet_b0(pretrained=True)
         self.base_model = models.convnext_tiny(weights=models.ConvNeXt_Tiny_Weights.IMAGENET1K_V1)
 
-        # Freeze the parameters
-        for param in self.base_model.parameters():
+        # # Freeze the parameters
+        # for param in self.base_model.parameters():
+        #     param.requires_grad = False
+
+        # Freeze only the first few layers
+        for param in list(self.base_model.parameters())[:-config.FREEZE]:
             param.requires_grad = False
 
         # CNN output features
@@ -218,7 +229,14 @@ class CNNRNN(nn.Module):
         # Fully connected layer
         self.fc = nn.Linear(2 * output_features, 256)
 
+        # Fully connected layer output features
         fc_out_features = 256
+
+        # Batch Normalization layer
+        self.bn = nn.BatchNorm1d(fc_out_features)
+
+        # Drop out layer
+        self.dropout = nn.Dropout(0.5)        
 
         # Define the new classifiers (heads)
         self.head1 = nn.Linear(fc_out_features, 1)  # binary label
@@ -237,6 +255,8 @@ class CNNRNN(nn.Module):
         packed_output, (hn, cn) = self.rnn(packed_input)
         rnn_out, _ = pad_packed_sequence(packed_output, batch_first=True)
         out = self.fc(rnn_out[:, -1, :])
+        out = self.bn(out)
+        out = self.dropout(out)
 
         out1 = self.head1(out)
         out2 = self.head2(out)
@@ -247,7 +267,7 @@ class CNNRNN(nn.Module):
         return out1, out2, out3, out4, out5
 
 class FocalLoss(nn.Module):
-    def __init__(self, alpha=1, gamma=2, reduction='mean'):
+    def __init__(self, alpha=0.5, gamma=2.5, reduction='sum'):
         super(FocalLoss, self).__init__()
         self.alpha = alpha
         self.gamma = gamma
@@ -263,6 +283,28 @@ class FocalLoss(nn.Module):
         elif self.reduction == 'mean':
             return F_loss.mean()
 
+class MultiClassFocalLoss(nn.Module):
+    def __init__(self, alpha=0.5, gamma=2.5, reduction='sum'):
+        super(MultiClassFocalLoss, self).__init__()
+        self.alpha = alpha
+        self.gamma = gamma
+        self.reduction = reduction
+
+    def forward(self, inputs, targets):
+        # ソフトマックスを使用して確率を計算
+        probs = F.softmax(inputs, dim=1)
+        
+        # 選択されたクラスの確率を取得
+        class_probs = probs.gather(1, targets.view(-1, 1))
+        
+        # Focal Lossの計算
+        F_loss = -self.alpha * (1-class_probs)**self.gamma * class_probs.log()
+        
+        if self.reduction == 'sum':
+            return F_loss.sum()
+        elif self.reduction == 'mean':
+            return F_loss.mean()
+
 # Define the device
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
@@ -272,11 +314,12 @@ model = model.to(device)
 
 # Define the loss function and optimizer
 #criterion1 = nn.BCEWithLogitsLoss()
-criterion1 = FocalLoss(alpha=1, gamma=2)
-criterion2 = nn.CrossEntropyLoss()
+criterion1 = FocalLoss(alpha=0.5, gamma=2.5)
+#criterion2 = nn.CrossEntropyLoss()
+criterion2 = MultiClassFocalLoss(alpha=0.5, gamma=2.5)
 optimizer = torch.optim.AdamW(model.parameters(), lr=0.001)
-#scheduler = CosineAnnealingLR(optimizer, T_max=10)
-scheduler = optim.lr_scheduler.OneCycleLR(optimizer, max_lr=0.01, steps_per_epoch=len(train_loader), epochs=10)
+scheduler = CosineAnnealingLR(optimizer, T_max=10)
+#scheduler = optim.lr_scheduler.OneCycleLR(optimizer, max_lr=0.01, steps_per_epoch=len(train_loader), epochs=10)
 
 # wandb setting
 import wandb
@@ -333,21 +376,26 @@ for epoch in range(config.EPOCHS):
 
         total_loss += loss.item()
 
-        # Calculate the accuracy
-        acc_bowel.update(outputs[0].cpu(), labels_list[0].cpu())
-        acc_extravasation.update(outputs[1].cpu(), labels_list[1].cpu())
-        acc_kidney.update(outputs[2].cpu(), labels_list[2].cpu())
-        acc_liver.update(outputs[3].cpu(), labels_list[3].cpu())
-        acc_spleen.update(outputs[4].cpu(), labels_list[4].cpu())
+        # Get the probabilities
+        probs_bowel = torch.sigmoid(outputs[0]).cpu()
+        probs_extravasation = torch.sigmoid(outputs[1]).cpu()
+        probs_kidney = F.softmax(outputs[2], dim=1).cpu()
+        probs_liver = F.softmax(outputs[3], dim=1).cpu()
+        probs_spleen = F.softmax(outputs[4], dim=1).cpu()
 
+        # Calculate the accuracy
+        acc_bowel.update(probs_bowel, labels_list[0].cpu())
+        acc_extravasation.update(probs_extravasation, labels_list[1].cpu())
+        acc_kidney.update(probs_kidney, labels_list[2].cpu())
+        acc_liver.update(probs_liver, labels_list[3].cpu())
+        acc_spleen.update(probs_spleen, labels_list[4].cpu())
 
         # Calculate the AUROC for each head
-        auc_bowel.update(outputs[0].cpu(), labels_list[0].cpu())
-        auc_extravasation.update(outputs[1].cpu(), labels_list[1].cpu())
-        auc_kidney.update(outputs[2].cpu(), labels_list[2].cpu())
-        auc_liver.update(outputs[3].cpu(), labels_list[3].cpu())
-        auc_spleen.update(outputs[4].cpu(), labels_list[4].cpu())
-
+        auc_bowel.update(probs_bowel, labels_list[0].cpu())
+        auc_extravasation.update(probs_extravasation, labels_list[1].cpu())
+        auc_kidney.update(probs_kidney, labels_list[2].cpu())
+        auc_liver.update(probs_liver, labels_list[3].cpu())
+        auc_spleen.update(probs_spleen, labels_list[4].cpu())
 
     # Add to the history
     train_acc_history.append({"EPOCH": epoch,
@@ -429,19 +477,26 @@ for epoch in range(config.EPOCHS):
             loss = loss1 + loss2 + loss3 + loss4 + loss5
             total_val_loss += loss.item()
 
+            # Get the probabilities
+            probs_bowel = torch.sigmoid(outputs[0]).cpu()
+            probs_extravasation = torch.sigmoid(outputs[1]).cpu()
+            probs_kidney = F.softmax(outputs[2], dim=1).cpu()
+            probs_liver = F.softmax(outputs[3], dim=1).cpu()
+            probs_spleen = F.softmax(outputs[4], dim=1).cpu()
+
             # Calculate the accuracy
-            val_acc_bowel.update(outputs[0].cpu(), labels_list[0].cpu())
-            val_acc_extravasation.update(outputs[1].cpu(), labels_list[1].cpu())
-            val_acc_kidney.update(outputs[2].cpu(), labels_list[2].cpu())
-            val_acc_liver.update(outputs[3].cpu(), labels_list[3].cpu())
-            val_acc_spleen.update(outputs[4].cpu(), labels_list[4].cpu())
+            val_acc_bowel.update(probs_bowel, labels_list[0].cpu())
+            val_acc_extravasation.update(probs_extravasation, labels_list[1].cpu())
+            val_acc_kidney.update(probs_kidney, labels_list[2].cpu())
+            val_acc_liver.update(probs_liver, labels_list[3].cpu())
+            val_acc_spleen.update(probs_spleen, labels_list[4].cpu())
 
             # Calculate the AUROC for each head
-            val_auc_bowel.update(outputs[0].cpu(), labels_list[0].cpu())
-            val_auc_extravasation.update(outputs[1].cpu(), labels_list[1].cpu())
-            val_auc_kidney.update(outputs[2].cpu(), labels_list[2].cpu())
-            val_auc_liver.update(outputs[3].cpu(), labels_list[3].cpu())
-            val_auc_spleen.update(outputs[4].cpu(), labels_list[4].cpu())
+            val_auc_bowel.update(probs_bowel, labels_list[0].cpu())
+            val_auc_extravasation.update(probs_extravasation, labels_list[1].cpu())
+            val_auc_kidney.update(probs_kidney, labels_list[2].cpu())
+            val_auc_liver.update(probs_liver, labels_list[3].cpu())
+            val_auc_spleen.update(probs_spleen, labels_list[4].cpu())
 
 
     # Add to the history
@@ -484,7 +539,6 @@ for epoch in range(config.EPOCHS):
         "val_spleen_acc": val_acc_spleen.compute(),
         "val_spleen_auc": val_auc_spleen.compute(),
         })
-
 
 # Save the model
 # torch.save(model.state_dict(), f"{config.BASE_PATH}/cnn_rnn_model3.pth")
