@@ -16,6 +16,8 @@ from sklearn.model_selection import train_test_split, StratifiedGroupKFold
 from torch.nn.utils.rnn import pad_sequence, pack_padded_sequence, pad_packed_sequence
 import torch.optim as optim
 from torch.optim.lr_scheduler import CosineAnnealingLR
+from skimage.restoration import denoise_nl_means, estimate_sigma
+from torchvision.transforms import ToPILImage, ToTensor
 
 # Set up the configuration
 class Config:
@@ -29,7 +31,8 @@ class Config:
         "bowel_healthy","bowel_injury", "extravasation_healthy","extravasation_injury",
         "kidney_healthy", "kidney_low", "kidney_high",
         "liver_healthy", "liver_low", "liver_high",
-        "spleen_healthy", "spleen_low", "spleen_high",
+        "spleen_healthy", "spleen_low", "spleen_high", 
+        "all"
     ]
     BASE_PATH = "/content/drive/MyDrive/kaggle/RSNA2023"
     HALF = False
@@ -79,8 +82,17 @@ dataframe = dataframe.loc[idx]
 # Stratify by the spleen and kindey (Those are not good learned by the model)
 dataframe['stratify'] = ''
 for col in config.TARGET_COLS:
-    if col in ['spleen_healthy', 'spleen_low', 'spleen_high']:
+    if col in [ "bowel_healthy","bowel_injury", "extravasation_healthy","extravasation_injury"]:
         dataframe['stratify'] += dataframe[col].astype(str)
+
+# Check all healthy columns are 0.
+# If all healthy columns are 1, then 'all' columns is 0
+# If one of the healthy columns is 0, then 'all' columns is 1(this means the patient has at least one injury)
+dataframe['all'] = 0
+healthy_cols = ['bowel_healthy', 'extravasation_healthy', 'kidney_healthy', 'liver_healthy', 'spleen_healthy']
+for col in healthy_cols:
+    dataframe['all'] += dataframe[col]
+dataframe['all'] = dataframe['all'].apply(lambda x: 0 if x == 5 else 1)
 
 # Define the dataset
 class CT_Slices_Dataset(Dataset):
@@ -139,6 +151,7 @@ class CT_Slices_Dataset(Dataset):
             'kidney': torch.argmax(torch.tensor(labels[4:7], dtype=torch.float32)), # multi-class label, [0, 1, 2]
             'liver': torch.argmax(torch.tensor(labels[7:10], dtype=torch.float32)), # multi-class label, [0, 1, 2]
             'spleen': torch.argmax(torch.tensor(labels[10:13], dtype=torch.float32)), # multi-class label, [0, 1, 2]
+            'all': torch.argmax(torch.tensor(labels[13], dtype=torch.float32)), # binary label, [0, 1]
         }
 
         return slices, len(slices), labels
@@ -157,14 +170,11 @@ def collate_fn(batch):
 
     return sequences_padded, lengths, labels_dict
 
-from skimage.restoration import denoise_nl_means, estimate_sigma
-from torchvision.transforms import ToPILImage, ToTensor
-
 # Define the transforms
 transform = transforms.Compose([
     transforms.Grayscale(num_output_channels=3),  # Convert grayscale to "RGB" (3 channels)
     transforms.Resize([256, 256]),
-    #transforms.CenterCrop([128, 128]),
+    transforms.CenterCrop([64, 64]),
     transforms.ToTensor(),
     transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
 ])
@@ -217,6 +227,9 @@ class CNNRNN(nn.Module):
         # RNN output features
         output_features = 256
 
+        # Fully connected layer output features
+        fc_out_features = 256
+
         # RNN (LSTM) layers
         self.rnn = nn.LSTM(
             input_size=cnn_out_features,
@@ -227,16 +240,13 @@ class CNNRNN(nn.Module):
         )
 
         # Fully connected layer
-        self.fc = nn.Linear(2 * output_features, 256)
-
-        # Fully connected layer output features
-        fc_out_features = 256
+        self.fc = nn.Linear(2 * output_features, fc_out_features)
 
         # Batch Normalization layer
         self.bn = nn.BatchNorm1d(fc_out_features)
 
         # Drop out layer
-        self.dropout = nn.Dropout(0.5)        
+        self.dropout = nn.Dropout(0.5)   
 
         # Define the new classifiers (heads)
         self.head1 = nn.Linear(fc_out_features, 1)  # binary label
@@ -244,6 +254,7 @@ class CNNRNN(nn.Module):
         self.head3 = nn.Linear(fc_out_features, 3)  # multi-class label
         self.head4 = nn.Linear(fc_out_features, 3)  # multi-class label
         self.head5 = nn.Linear(fc_out_features, 3)  # multi-class label
+        self.head6 = nn.Linear(fc_out_features, 1)  # multi-class label
 
     def forward(self, x, lengths):
         batch_size, timesteps, C, H, W = x.size()
@@ -263,8 +274,9 @@ class CNNRNN(nn.Module):
         out3 = self.head3(out)
         out4 = self.head4(out)
         out5 = self.head5(out)
+        out6 = self.head6(out)
 
-        return out1, out2, out3, out4, out5
+        return out1, out2, out3, out4, out5, out6
 
 class FocalLoss(nn.Module):
     def __init__(self, alpha=0.5, gamma=2.5, reduction='sum'):
@@ -314,12 +326,12 @@ model = model.to(device)
 
 # Define the loss function and optimizer
 #criterion1 = nn.BCEWithLogitsLoss()
-criterion1 = FocalLoss(alpha=0.5, gamma=2.5)
+criterion1 = FocalLoss(alpha=0.5, gamma=3)
 #criterion2 = nn.CrossEntropyLoss()
-criterion2 = MultiClassFocalLoss(alpha=0.5, gamma=2.5)
+criterion2 = MultiClassFocalLoss(alpha=0.5, gamma=3)
 optimizer = torch.optim.AdamW(model.parameters(), lr=0.001)
-scheduler = CosineAnnealingLR(optimizer, T_max=10)
-#scheduler = optim.lr_scheduler.OneCycleLR(optimizer, max_lr=0.01, steps_per_epoch=len(train_loader), epochs=10)
+#scheduler = CosineAnnealingLR(optimizer, T_max=10)
+scheduler = optim.lr_scheduler.OneCycleLR(optimizer, max_lr=0.01, steps_per_epoch=len(train_loader), epochs=10)
 
 # wandb setting
 import wandb
@@ -328,12 +340,6 @@ mykey = '775553d8bb6bd0180350fae46e7d47bd9ef3f0d9'
 if wandb is not None:
     wandb.login(key=mykey)
     run = wandb.init(project="RSNA2023", config=wandb_config)
-
-# Acccuracy, AUROC
-train_acc_history = []
-train_auroc_history = []
-val_acc_history = []
-val_auc_history = []
 
 # Train the model
 for epoch in range(config.EPOCHS):
@@ -352,6 +358,9 @@ for epoch in range(config.EPOCHS):
     auc_liver = MulticlassAUROC(num_classes=3)
     auc_spleen = MulticlassAUROC(num_classes=3)
 
+    acc_all = BinaryAccuracy()
+    auc_all = BinaryAUROC()
+
     for i, (inputs, lengths, labels_dict) in enumerate(tqdm(train_loader)):
 
         labels_dict = {k: v.to(device) for k, v in labels_dict.items()}
@@ -368,8 +377,9 @@ for epoch in range(config.EPOCHS):
         loss3 = criterion2(outputs[2], labels_list[2])
         loss4 = criterion2(outputs[3], labels_list[3])
         loss5 = criterion2(outputs[4], labels_list[4])
+        loss6 = criterion1(outputs[5], labels_list[5].float())
         # Sum all the losses
-        loss = loss1 + loss2 + loss3 + loss4 + loss5
+        loss = loss1 + loss2 + loss3 + loss4 + loss5 + loss6
         loss.backward()
         optimizer.step()
         scheduler.step()
@@ -382,6 +392,7 @@ for epoch in range(config.EPOCHS):
         probs_kidney = F.softmax(outputs[2], dim=1).cpu()
         probs_liver = F.softmax(outputs[3], dim=1).cpu()
         probs_spleen = F.softmax(outputs[4], dim=1).cpu()
+        probs_all = torch.sigmoid(outputs[5]).cpu()
 
         # Calculate the accuracy
         acc_bowel.update(probs_bowel, labels_list[0].cpu())
@@ -389,6 +400,7 @@ for epoch in range(config.EPOCHS):
         acc_kidney.update(probs_kidney, labels_list[2].cpu())
         acc_liver.update(probs_liver, labels_list[3].cpu())
         acc_spleen.update(probs_spleen, labels_list[4].cpu())
+        acc_all.update(probs_all, labels_list[5].cpu())
 
         # Calculate the AUROC for each head
         auc_bowel.update(probs_bowel, labels_list[0].cpu())
@@ -396,46 +408,50 @@ for epoch in range(config.EPOCHS):
         auc_kidney.update(probs_kidney, labels_list[2].cpu())
         auc_liver.update(probs_liver, labels_list[3].cpu())
         auc_spleen.update(probs_spleen, labels_list[4].cpu())
+        auc_all.update(probs_all, labels_list[5].cpu())
 
-    # Add to the history
-    train_acc_history.append({"EPOCH": epoch,
-                              "bowel": acc_bowel.compute(),
-                              "extravasation": acc_extravasation.compute(),
-                              "kidney": acc_kidney.compute(),
-                              "liver": acc_liver.compute(),
-                              "spleen": acc_spleen.compute()})
-    train_auroc_history.append({"EPOCH": epoch,
-                                "bowel": auc_bowel.compute(),
-                                "extravasation": auc_extravasation.compute(),
-                                "kidney": auc_kidney.compute(),
-                                "liver": auc_liver.compute(),
-                                "spleen": auc_spleen.compute()})
+    # Compute the epoch acc and auc
+    res_acc_bowel = acc_bowel.compute()
+    res_acc_extravasation = acc_extravasation.compute()
+    res_acc_kidney = acc_kidney.compute()
+    res_acc_liver = acc_liver.compute()
+    res_acc_spleen = acc_spleen.compute()
+    res_acc_all = acc_all.compute()
+
+    res_auc_bowel = auc_bowel.compute()
+    res_auc_extravasation = auc_extravasation.compute()
+    res_auc_kidney = auc_kidney.compute()
+    res_auc_liver = auc_liver.compute()
+    res_auc_spleen = auc_spleen.compute()
+    res_auc_all = auc_all.compute()
 
     print({'EPOCH': epoch})
-    print({'head': 'Train/Accuracy_head_0', 'acc': acc_bowel.compute(), 'epoch': epoch})
-    print({'head': 'Train/AUC_head_0', 'auc': auc_bowel.compute(), 'epoch': epoch})
-    print({'head': 'Train/Accuracy_head_1', 'acc': acc_extravasation.compute(), 'epoch': epoch})
-    print({'head': 'Train/AUC_head_1', 'auc': auc_extravasation.compute(), 'epoch': epoch})
-    print({'head': 'Train/Accuracy_head_2', 'acc': acc_kidney.compute(), 'epoch': epoch})
-    print({'head': 'Train/AUC_head_2', 'auc': auc_kidney.compute(), 'epoch': epoch})
-    print({'head': 'Train/Accuracy_head_3', 'acc': acc_liver.compute(), 'epoch': epoch})
-    print({'head': 'Train/AUC_head_3', 'auc': auc_liver.compute(), 'epoch': epoch})
-    print({'head': 'Train/Accuracy_head_4', 'acc': acc_spleen.compute(), 'epoch': epoch})
-    print({'head': 'Train/AUC_head_4', 'auc': auc_spleen.compute(), 'epoch': epoch})
+    print({'head': 'Train/Accuracy_head_0', 'acc': res_acc_bowel, 'epoch': epoch})
+    print({'head': 'Train/AUC_head_0', 'auc': res_auc_bowel, 'epoch': epoch})
+    print({'head': 'Train/Accuracy_head_1', 'acc': res_acc_extravasation, 'epoch': epoch})
+    print({'head': 'Train/AUC_head_1', 'auc': res_auc_extravasation, 'epoch': epoch})
+    print({'head': 'Train/Accuracy_head_2', 'acc': res_acc_kidney, 'epoch': epoch})
+    print({'head': 'Train/AUC_head_2', 'auc': res_auc_kidney, 'epoch': epoch})
+    print({'head': 'Train/Accuracy_head_3', 'acc': res_acc_liver, 'epoch': epoch})
+    print({'head': 'Train/AUC_head_3', 'auc': res_auc_liver, 'epoch': epoch})
+    print({'head': 'Train/Accuracy_head_4', 'acc': res_acc_spleen, 'epoch': epoch})
+    print({'head': 'Train/AUC_head_4', 'auc': res_auc_spleen, 'epoch': epoch})
 
     if wandb is not None:
         run.log({
         'EPOCH': epoch,
-        "bowel_acc": acc_bowel.compute(),
-        "bowel_auc": auc_bowel.compute(),
-        "extravasation_acc": acc_extravasation.compute(),
-        "extravasation_auc": auc_extravasation.compute(),
-        "kidney_acc": acc_kidney.compute(),
-        "kidney_auc": auc_kidney.compute(),
-        "liver_acc": acc_liver.compute(),
-        "liver_auc": auc_liver.compute(),
-        "spleen_acc": acc_spleen.compute(),
-        "spleen_auc": auc_spleen.compute(),
+        "train_bowel_acc": res_acc_bowel,
+        "train_bowel_auc": res_auc_bowel,
+        "train_extravasation_acc": res_acc_extravasation,
+        "train_extravasation_auc": res_auc_extravasation,
+        "train_kidney_acc": res_acc_kidney,
+        "train_kidney_auc": res_auc_kidney,
+        "train_liver_acc": res_acc_liver,
+        "train_liver_auc": res_auc_liver,
+        "train_spleen_acc": res_acc_spleen,
+        "train_spleen_auc": res_auc_spleen,
+        "train_all_acc": res_acc_all,
+        "train_all_auc": res_auc_all,
         })
 
     # Validation
@@ -455,6 +471,9 @@ for epoch in range(config.EPOCHS):
     val_auc_liver = MulticlassAUROC(num_classes=3)
     val_auc_spleen = MulticlassAUROC(num_classes=3)
 
+    val_acc_all = BinaryAccuracy()
+    val_auc_all = BinaryAUROC()
+
 
     with torch.no_grad():
         for  i, (inputs, lengths, labels_dict) in enumerate(tqdm(val_loader)):
@@ -473,8 +492,9 @@ for epoch in range(config.EPOCHS):
             loss3 = criterion2(outputs[2], labels_list[2])
             loss4 = criterion2(outputs[3], labels_list[3])
             loss5 = criterion2(outputs[4], labels_list[4])
+            loss6 = criterion1(outputs[5], labels_list[5].float())
             # Sum all the losses
-            loss = loss1 + loss2 + loss3 + loss4 + loss5
+            loss = loss1 + loss2 + loss3 + loss4 + loss5 + loss6
             total_val_loss += loss.item()
 
             # Get the probabilities
@@ -483,6 +503,7 @@ for epoch in range(config.EPOCHS):
             probs_kidney = F.softmax(outputs[2], dim=1).cpu()
             probs_liver = F.softmax(outputs[3], dim=1).cpu()
             probs_spleen = F.softmax(outputs[4], dim=1).cpu()
+            probs_all = torch.sigmoid(outputs[5]).cpu()
 
             # Calculate the accuracy
             val_acc_bowel.update(probs_bowel, labels_list[0].cpu())
@@ -490,6 +511,7 @@ for epoch in range(config.EPOCHS):
             val_acc_kidney.update(probs_kidney, labels_list[2].cpu())
             val_acc_liver.update(probs_liver, labels_list[3].cpu())
             val_acc_spleen.update(probs_spleen, labels_list[4].cpu())
+            val_acc_all.update(probs_all, labels_list[5].cpu())
 
             # Calculate the AUROC for each head
             val_auc_bowel.update(probs_bowel, labels_list[0].cpu())
@@ -497,47 +519,51 @@ for epoch in range(config.EPOCHS):
             val_auc_kidney.update(probs_kidney, labels_list[2].cpu())
             val_auc_liver.update(probs_liver, labels_list[3].cpu())
             val_auc_spleen.update(probs_spleen, labels_list[4].cpu())
+            val_auc_all.update(probs_all, labels_list[5].cpu())
 
+    # Compute the epoch acc and auc
+    res_val_acc_bowel = val_acc_bowel.compute()
+    res_val_acc_extravasation = val_acc_extravasation.compute()
+    res_val_acc_kidney = val_acc_kidney.compute()
+    res_val_acc_liver = val_acc_liver.compute()
+    res_val_acc_spleen = val_acc_spleen.compute()
+    res_val_acc_all = val_acc_all.compute()
 
-    # Add to the history
-    val_acc_history.append({"EPOCH": epoch,
-                                "bowel": val_acc_bowel.compute(),
-                                "extravasation": val_acc_extravasation.compute(),
-                                "kidney": val_acc_kidney.compute(),
-                                "liver": val_acc_liver.compute(),
-                                "spleen": val_acc_spleen.compute()})
-    val_auc_history.append({"EPOCH": epoch,
-                                "bowel": val_auc_bowel.compute(),
-                                "extravasation": val_auc_extravasation.compute(),
-                                "kidney": val_auc_kidney.compute(),
-                                "liver": val_auc_liver.compute(),
-                                "spleen": val_auc_spleen.compute()})
+    res_val_auc_bowel = val_auc_bowel.compute()
+    res_val_auc_extravasation = val_auc_extravasation.compute()
+    res_val_auc_kidney = val_auc_kidney.compute()
+    res_val_auc_liver = val_auc_liver.compute()
+    res_val_auc_spleen = val_auc_spleen.compute()
+    res_val_auc_all = val_auc_all.compute()
 
     print({'EPOCH': epoch})
-    print({'head': 'Validation/Accuracy_head_0', 'acc': val_acc_bowel.compute(), 'epoch': epoch})
-    print({'head': 'Validation/AUC_head_0', 'auc': val_auc_bowel.compute(), 'epoch': epoch})
-    print({'head': 'Validation/Accuracy_head_1', 'acc': val_acc_extravasation.compute(), 'epoch': epoch})
-    print({'head': 'Validation/AUC_head_1', 'auc': val_auc_extravasation.compute(), 'epoch': epoch})
-    print({'head': 'Validation/Accuracy_head_2', 'acc': val_acc_kidney.compute(), 'epoch': epoch})
-    print({'head': 'Validation/AUC_head_2', 'auc': val_auc_kidney.compute(), 'epoch': epoch})
-    print({'head': 'Validation/Accuracy_head_3', 'acc': val_acc_liver.compute(), 'epoch': epoch})
-    print({'head': 'Validation/AUC_head_3', 'auc': val_auc_liver.compute(), 'epoch': epoch})
-    print({'head': 'Validation/Accuracy_head_4', 'acc': val_acc_spleen.compute(), 'epoch': epoch})
-    print({'head': 'Validation/AUC_head_4', 'auc': val_auc_spleen.compute(), 'epoch': epoch})
+    print({'head': 'Validation/Accuracy_head_0', 'acc': res_val_acc_bowel, 'epoch': epoch})
+    print({'head': 'Validation/AUC_head_0', 'auc': res_val_auc_bowel, 'epoch': epoch})
+    print({'head': 'Validation/Accuracy_head_1', 'acc': res_val_acc_extravasation, 'epoch': epoch})
+    print({'head': 'Validation/AUC_head_1', 'auc': res_val_auc_extravasation, 'epoch': epoch})
+    print({'head': 'Validation/Accuracy_head_2', 'acc': res_val_acc_kidney, 'epoch': epoch})
+    print({'head': 'Validation/AUC_head_2', 'auc': res_val_auc_kidney, 'epoch': epoch})
+    print({'head': 'Validation/Accuracy_head_3', 'acc': res_val_acc_liver, 'epoch': epoch})
+    print({'head': 'Validation/AUC_head_3', 'auc': res_val_auc_liver, 'epoch': epoch})
+    print({'head': 'Validation/Accuracy_head_4', 'acc': res_val_acc_spleen, 'epoch': epoch})
+    print({'head': 'Validation/AUC_head_4', 'auc': res_val_auc_spleen, 'epoch': epoch})
+
 
     if wandb is not None:
         run.log({
         'EPOCH': epoch,
-        "val_bowel_acc": val_acc_bowel.compute(),
-        "val_bowel_auc": val_auc_bowel.compute(),
-        "val_extravasation_acc": val_acc_extravasation.compute(),
-        "val_extravasation_auc": val_auc_extravasation.compute(),
-        "val_kidney_acc": val_acc_kidney.compute(),
-        "val_kidney_auc": val_auc_kidney.compute(),
-        "val_liver_acc": val_acc_liver.compute(),
-        "val_liver_auc": val_auc_liver.compute(),
-        "val_spleen_acc": val_acc_spleen.compute(),
-        "val_spleen_auc": val_auc_spleen.compute(),
+        "val_bowel_acc": res_val_acc_bowel,
+        "val_bowel_auc": res_val_auc_bowel,
+        "val_extravasation_acc": res_val_acc_extravasation,
+        "val_extravasation_auc": res_val_auc_extravasation,
+        "val_kidney_acc": res_val_acc_kidney,
+        "val_kidney_auc": res_val_auc_kidney,
+        "val_liver_acc": res_val_acc_liver,
+        "val_liver_auc": res_val_auc_liver,
+        "val_spleen_acc": res_val_acc_spleen,
+        "val_spleen_auc": res_val_auc_spleen,
+        "val_all_acc": res_val_acc_all,
+        "val_all_auc": res_val_auc_all,
         })
 
 # Save the model
